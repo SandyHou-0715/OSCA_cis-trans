@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "vector": "cpp",
+        "__config": "c",
+        "__threading_support": "c",
+        "chrono": "c",
+        "ctime": "c",
+        "__node_handle": "c"
+    }
+}

@@ -125,26 +125,30 @@ plinkopen(const char *filename)
     // make trime_allel_list for allel longer than PLINE_MAX_ALLEL_LEN - 1
     char line_buf[PLINK_LINE_BUF_LEN];
     line_buf[PLINK_LINE_BUF_LEN - 1] = 1;
-    char chrom[16];
-    chrom[15] = '\0';
-    char rsid[64];
-    rsid[63] = '\0';
-    char phy_pos[16];
-    phy_pos[15] = '\0';
-    char pos[16];
-    pos[15] = '\0';
-    char allel1[1024];
-    allel1[1023] = '\0';
-    char allel2[1024];
-    allel2[1023] = '\0';
+    char line_buf_bk[PLINK_LINE_BUF_LEN];
+    line_buf_bk[PLINK_LINE_BUF_LEN - 1] = 1;
+    char *chrom;
+    char *rsid;
+    char *phy_pos;
+    char *pos;
+    char *allel1;
+    char *allel2;
 
     fin = data_out.bim_file;
     uint32_t line_index = 0;
     while (fgets(line_buf, PLINK_LINE_BUF_LEN, fin)) {
         if (line_buf[PLINK_LINE_BUF_LEN - 1] == 1) {
-            if (sscanf(line_buf, "%s %s %s %s %s %s",
-                chrom, rsid, phy_pos, pos, allel1, allel2) == 6) {
-                if (allel1[1023] == '\0') {
+            strcpy(line_buf_bk, line_buf);
+            chrom = strtok(line_buf_bk, "\t");
+            rsid = strtok(NULL, "\t");
+            phy_pos = strtok(NULL, "\t");
+            pos = strtok(NULL, "\t");
+            allel1 = strtok(NULL, "\t");
+            allel2 = strtok(NULL, "\t");
+            int len = strcspn(allel2, "\n");
+            if (len < strlen(allel2))   allel2[len] = '\0';
+            if (chrom != NULL && rsid != NULL && phy_pos != NULL && pos != NULL && allel1 != NULL && allel2 != NULL) {
+                if (allel1) {
                     uint32_t allel_len = strlen(allel1);
                     if (allel_len >= PLINK_MAX_ALLEL_LEN) {
                         struct Allel_trimed_stu *new_node =
@@ -177,7 +181,7 @@ plinkopen(const char *filename)
                     return data_out;
                 }
 
-                if (allel2[1023] == '\0') {
+                if (allel2) {
                     uint32_t allel_len = strlen(allel2);
                     if (allel_len >= PLINK_MAX_ALLEL_LEN) {
                         struct Allel_trimed_stu *new_node =
@@ -500,19 +504,15 @@ bimreadline(PLINKFILE_ptr plink_dara, BIM_LINE_ptr bim_line)
     FILE *fin = plink_dara->bim_file;
     char *line_buf = plink_dara->line_buf;
     line_buf[PLINK_LINE_BUF_LEN - 1] = 1;
+    char line_buf_bk[PLINK_LINE_BUF_LEN];
+    line_buf_bk[PLINK_LINE_BUF_LEN - 1] = 1;
 
-    char chrom[16];
-    chrom[15] = '\0';
-    char rsid[64];
-    rsid[63] = '\0';
-    char phy_pos[16];
-    phy_pos[15] = '\0';
-    char pos[16];
-    pos[15] = '\0';
-    char allel1[1024];
-    allel1[1023] = '\0';
-    char allel2[1024];
-    allel2[1023] = '\0';
+    char *chrom;
+    char *rsid;
+    char *phy_pos;
+    char *pos;
+    char *allel1;
+    char *allel2;
     int str_len = 0;
     char *char_ptr = NULL;
 
@@ -522,13 +522,21 @@ bimreadline(PLINKFILE_ptr plink_dara, BIM_LINE_ptr bim_line)
             fprintf(stderr, "bim file line buf overflow.\n");
             return 1;
         }
-        if (sscanf(line_buf, "%s %s %s %s %s %s", chrom, rsid, phy_pos, pos,
-            allel1, allel2) != 6) {
+        strcpy(line_buf_bk, line_buf);
+        chrom = strtok(line_buf_bk, "\t");
+        rsid = strtok(NULL, "\t");
+        phy_pos = strtok(NULL, "\t");
+        pos = strtok(NULL, "\t");
+        allel1 = strtok(NULL, "\t");
+        allel2 = strtok(NULL, "\t");
+        int len = strcspn(allel2, "\n");
+        if (len < strlen(allel2))   allel2[len] = '\0';
+        if (chrom == NULL || rsid == NULL || phy_pos == NULL || pos == NULL || allel1 == NULL || allel2 == NULL) {
             fprintf(stderr, "split bim line fields failed.\n");
             return 1;
         }
 
-        if (chrom[15] == '\0') {
+        if (chrom) {
             str_len = strlen(chrom);
             char_ptr = chrom;
             while (isdigit(*char_ptr)) {
@@ -551,19 +559,19 @@ bimreadline(PLINKFILE_ptr plink_dara, BIM_LINE_ptr bim_line)
             }
         }
 
-        if (rsid[63] == '\0') {
+        if (rsid) {
             strcpy(bim_line->rsid, rsid);
         } else {
             fprintf(stderr, "rsid field failed.\n");
             return 1;
         }
-        if (phy_pos[15] == '\0') {
+        if (phy_pos) {
             bim_line->phy_pos = (float)atof(phy_pos);
         } else {
             fprintf(stderr, "physical position field failed.\n");
             return 1;
         }
-        if (pos[15] == '\0') {
+        if (pos) {
             str_len = strlen(pos);
             char_ptr = pos;
             while (isdigit(*char_ptr)) {
@@ -582,27 +590,29 @@ bimreadline(PLINKFILE_ptr plink_dara, BIM_LINE_ptr bim_line)
             fprintf(stderr, "bim position field failed.\n");
             return 1;
         }
-        if (allel1[1023] == '\0') {
-            str_len = strlen(allel1);
-            if (str_len >= PLINK_MAX_ALLEL_LEN) {
-                // lookup Allel_trimed_stu recall allel string.
-                (bim_line->allel1)[0] = '\0';
-            } else {
-                strcpy(bim_line->allel1, allel1);
-            }
+        if (allel1) {
+            strcpy(bim_line->allel1, allel1);
+            // str_len = strlen(allel1);
+            // if (str_len >= PLINK_MAX_ALLEL_LEN) {
+            //     // lookup Allel_trimed_stu recall allel string.
+            //     (bim_line->allel1)[0] = '\0';
+            // } else {
+            //     strcpy(bim_line->allel1, allel1);
+            // }
             
         } else {
             fprintf(stderr, "bim allel failed.\n");
             return 1;
         }
 
-        if (allel2[1023] == '\0') {
-            str_len = strlen(allel2);
-            if (str_len >= PLINK_MAX_ALLEL_LEN) {
-                (bim_line->allel2)[0] = '\0';
-            } else {
-                strcpy(bim_line->allel2, allel2);
-            }
+        if (allel2) {
+            strcpy(bim_line->allel2, allel2);
+            // str_len = strlen(allel2);
+            // if (str_len >= PLINK_MAX_ALLEL_LEN) {
+            //     (bim_line->allel2)[0] = '\0';
+            // } else {
+            //     strcpy(bim_line->allel2, allel2);
+            // }
 
         } else {
             fprintf(stderr, "bim allel failed.\n");

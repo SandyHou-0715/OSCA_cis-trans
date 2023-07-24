@@ -138,8 +138,8 @@ namespace EFILE {
                 else {
                     double valtmp=atof(strlist[i].c_str());
                     if(!valueType && valtmp<0) {
-                        if(filetype == 1) { LOGPRINTF("ERROR: Beta value of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
-                        else if (filetype == 0) { LOGPRINTF("ERROR: TPM of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
+                        // if(filetype == 1) { LOGPRINTF("ERROR: Beta value of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
+                        if (filetype == 0) { LOGPRINTF("ERROR: TPM of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
                         TERMINATE();
                     } else {
                         einfo->_val[pid*einfo->_eii_num+line_idx]=valtmp;
@@ -241,7 +241,7 @@ namespace EFILE {
     void  read_efile_t(char* eFileName, eInfo* einfo, uint32_t filetype, bool no_fid_flag,int valueType){
 
         FILE* efile=NULL;
-         einfo->_eType=filetype;
+        einfo->_eType=filetype;
         einfo->_valType=valueType;
         vector<string> strlist;
         uint32_t line_idx = 0;
@@ -348,8 +348,8 @@ namespace EFILE {
                 else {
                     double valtmp=atof(strlist[i].c_str());
                     if(!valueType && valtmp<0) {
-                        if(filetype == 1) { LOGPRINTF("ERROR: Beta value of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
-                        else if (filetype == 0) { LOGPRINTF("ERROR: TPM of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
+                        // if(filetype == 1) { LOGPRINTF("ERROR: Beta value of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
+                        if (filetype == 0) { LOGPRINTF("ERROR: TPM of probe %s should be positive.\n", einfo->_epi_prb[line_idx].c_str());}
                         TERMINATE();
                     } else {
                         einfo->_val[line_idx*einfo->_eii_num+iid]=valtmp;

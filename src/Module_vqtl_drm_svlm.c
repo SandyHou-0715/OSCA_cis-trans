@@ -15,6 +15,7 @@
 
 
     --Benjamin Fang, 20230215
+    --Junren Hou and Xinran Liu, 20230711
 */
 
 
@@ -34,6 +35,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#include <uuid/uuid.h>
 
 #include "../lib/plinklite.h"
 #include "../lib/bodfile.h"
@@ -41,9 +43,16 @@
 #include "../lib/besdfile.h"
 
 
+
 #define MODULE_NAME "vqtl"
 #define VQTL_DRM_METHOD "drm"
 #define VQTL_SVLM_METHOD "svlm"
+
+//epi_chrom&postion structure
+typedef struct {
+    char chromosome[50];
+    long position;
+} EPI_ESI_COMMENT;
 
 
 /*->>vqtl args*/
@@ -97,7 +106,7 @@ typedef struct {
     uint32_t align_len;
 
     char not_need_align;
-
+    
     uint32_t *fam_index_array;
     uint32_t *oii_index_array;
 
@@ -112,6 +121,16 @@ typedef struct {
     double *geno_array;
     double *pheno_array;
     float *result;
+
+    bool flag_trans;
+    int opt_trans_distance_bp;
+    bool flag_cis;
+    int opt_cis_window_bp;
+
+    EPI_ESI_COMMENT *esi_infoArray;
+    EPI_ESI_COMMENT *epi_value;
+    int valid_num;
+
 
 } DRM_THREAD_ARGS, *DRM_THREAD_ARGS_ptr;
 /*<<- DRM Thread argument structure*/
@@ -147,6 +166,15 @@ typedef struct {
     double *pheno_array;
     float *result;
 
+    bool flag_trans;
+    int opt_trans_distance_bp;
+    bool flag_cis;
+    int opt_cis_window_bp;
+
+    EPI_ESI_COMMENT *esi_infoArray;
+    EPI_ESI_COMMENT *epi_value;
+    int valid_num;
+
 } SVLM_THREAD_ARGS, *SVLM_THREAD_ARGS_ptr;
 /*<<- SVLM Thread argument structure*/
 
@@ -171,7 +199,8 @@ static DRM_THREAD_ARGS_ptr make_drm_threads_args(
     uint32_t align_len, char not_need_align, uint32_t *fam_index_array,
     uint32_t *oii_index_array, uint32_t probe_slice_start,
     uint32_t probe_slice_len, char *variant_data, uint64_t variant_data_len,
-    uint32_t variant_load_len, DRM_THREAD_ARGS_ptr thread_args);
+    uint32_t variant_load_len, bool flag_trans, int opt_trans_distance_bp, bool flag_cis,
+    int opt_cis_window_bp, DRM_THREAD_ARGS_ptr thread_args);
 static void free_drm_threads_args_malloc(DRM_THREAD_ARGS_ptr args, int thread_num);
 static void *drm_thread_worker(void *args);
 
@@ -181,7 +210,8 @@ static SVLM_THREAD_ARGS_ptr make_svlm_threads_args(
     uint32_t align_len, char not_need_align, uint32_t *fam_index_array,
     uint32_t *oii_index_arrary, uint32_t probe_slice_start,
     uint32_t probe_slice_len, char *variant_data, uint64_t variant_data_len,
-    uint32_t variant_load_len, SVLM_THREAD_ARGS_ptr thread_args);
+    uint32_t variant_load_len, bool flag_trans, int opt_trans_distance_bp, bool flag_cis,
+    int opt_cis_window_bp, SVLM_THREAD_ARGS_ptr thread_args);
 static void free_svlm_threads_args_malloc(SVLM_THREAD_ARGS_ptr thread_args,
     int thread_num);
 static void *svlm_thread_worker(void *args);
@@ -273,6 +303,7 @@ Module_vqtl_drm(int argc, char *argv[])
     int task_id = args->opt_tast_id;
     
     char res_fname[1024];
+    char epi_fname[1024];
     if (args->opt_outname) {
         strcpy(res_fname, args->opt_outname);
     } else {
@@ -316,16 +347,20 @@ Module_vqtl_drm(int argc, char *argv[])
     res_fname[res_fname_len] = '\0';
     strcat(res_fname, ".epi");
     FILE *epi_fout = fopen(res_fname, "w");
+    strcpy(epi_fname, res_fname);
     //pass lines
     for (int i = 0; i < probe_start_offset; i++) {
         OPI_LINE opi_line;
         opireadline(&bod_data, &opi_line);
     }
+    //sum epi number of bars
+    uint32_t epi_num_bars = 0;
     for (int i = probe_start_offset; i < probe_end; i++) {
         OPI_LINE opi_line;
         char chrom[4];
         char ori[4];
         opireadline(&bod_data, &opi_line);
+        char gd[2] = "0"; // add new column for gradient distance in .epi
         if (opi_line.chrom == 201) {
             strcpy(chrom, "X");
         } else if (opi_line.chrom == 202) {
@@ -342,8 +377,9 @@ Module_vqtl_drm(int argc, char *argv[])
         } else {
             strcpy(ori, "-");
         }
-        fprintf(epi_fout, "%s\t%s\t%u\t%s\t%s\n", chrom, opi_line.probe_id,
-            opi_line.position, opi_line.gene_id, ori);
+        fprintf(epi_fout, "%s\t%s\t%s\t%u\t%s\t%s\n", chrom, opi_line.probe_id,
+            gd, opi_line.position, opi_line.gene_id, ori);
+        epi_num_bars++;
     }
     fclose(epi_fout);
     printf("epi file was writen.\n");
@@ -395,18 +431,24 @@ Module_vqtl_drm(int argc, char *argv[])
     make_drm_threads_args(thread_num, indi_num_fam, indi_num_oii, align_len,
         not_need_align,fam_index_array, oii_index_array,
         probe_slice_start, probe_slice_len,
-        variant_data, variant_data_len, variant_load_len,
-        threads_args);
+        variant_data, variant_data_len, variant_load_len, args->flag_trans,
+        args->opt_trans_distance_bp, args->flag_cis, args->opt_cis_window_bp, threads_args);
 
     // creat tmp directory
     char tmp_dir_name[256];
     time_t sec = time(NULL);
+    uuid_t uuid; // uuid
+	char uuid_str[37];
+	uuid_generate(uuid);
+	uuid_unparse(uuid, uuid_str);
+    char *uuid_str_break;
+	uuid_str_break = strtok(uuid_str, "-");
     if (task_num > 0 && task_id > 0) {
-        sprintf(tmp_dir_name, "oscatmp_%lu_%d_%d", sec, task_num, task_id);
+        sprintf(tmp_dir_name, "oscatmp_%s_%d_%d", uuid_str_break, task_num, task_id);
     } else if (task_num > 0) {
-        sprintf(tmp_dir_name, "oscatmp_%lu_%d_%d", sec, task_num, 1);
+        sprintf(tmp_dir_name, "oscatmp_%s_%d_%d", uuid_str_break, task_num, 1);
     } else {
-        sprintf(tmp_dir_name, "oscatmp_%lu", sec);
+        sprintf(tmp_dir_name, "oscatmp_%s", uuid_str_break);
     }
     
     char tmp_fname[1024];
@@ -426,8 +468,8 @@ Module_vqtl_drm(int argc, char *argv[])
             }
         }
     }
-    printf("temporary direcoty %s was created.\n", tmp_dir_name);
-    fprintf(flog, "temporary direcotyr %s was created.\n", tmp_dir_name);
+    printf("temporary directory %s was created.\n", tmp_dir_name);
+    fprintf(flog, "temporary directory %s was created.\n", tmp_dir_name);
 
     // malloc buffer for drm_write_tmp_data funtion.
     uint32_t *variant_index_pass_thresh = (uint32_t *)malloc(sizeof(uint32_t) *
@@ -450,7 +492,14 @@ Module_vqtl_drm(int argc, char *argv[])
         BIM_LINE bim_line;
         bimreadline(&plink_data, &bim_line);
     }
-
+    //read epi
+    FILE *epi = fopen(epi_fname, "r");
+        if (epi == NULL) {
+            fprintf(stderr, "Failed to open epi_file\n");
+            fprintf(flog, "Failed to open epi_file\n");
+            return 1;
+        }
+  
     for (int i = variant_start_offset; i < variant_end; i += variant_load_len) {
         variant_slice_start = i;
         if (i + variant_load_len > variant_end) {
@@ -486,6 +535,7 @@ Module_vqtl_drm(int argc, char *argv[])
 
         //write esi file
         char *variant_data_ptr = variant_data;
+        EPI_ESI_COMMENT *esi_infoArray = (EPI_ESI_COMMENT *)malloc(sizeof(EPI_ESI_COMMENT) * variant_slice_len); 
         for (int i = 0; i < variant_slice_len; i++) {
             float first_allel_freq = 0;
             uint32_t value_num = 0;
@@ -526,10 +576,10 @@ Module_vqtl_drm(int argc, char *argv[])
                     }
                     trimed_allel_tmp = trimed_allel_tmp->next;
                 }
-                if (!allel1) {
-                    fprintf(stderr, "can not find trimed allel.\n");
-                    return 1;
-                }
+                // if (!allel1) {
+                //     fprintf(stderr, "can not find trimed allel.\n");
+                //     return 1;
+                // }
             } else {
                 allel1 = bim_line.allel1;
             }
@@ -543,18 +593,21 @@ Module_vqtl_drm(int argc, char *argv[])
                     }
                     trimed_allel_tmp = trimed_allel_tmp->next;
                 }
-                if (!allel2) {
-                    fprintf(stderr, "can not find trimed allel.\n");
-                    return 1;
-                }
+                // if (!allel2) {
+                //     fprintf(stderr, "can not find trimed allel.\n");
+                //     return 1;
+                // }
             } else {
                 allel2 = bim_line.allel2;
             }
             fprintf(esi_fout, "%s\t%s\t%f\t%u\t%s\t%s\t%f\n", chrom, bim_line.rsid,
                 bim_line.phy_pos, bim_line.pos, allel1,
-                allel2, first_allel_freq);            
+                allel2, first_allel_freq);
+            strncpy(esi_infoArray[i].chromosome, chrom, sizeof(esi_infoArray[i].chromosome) - 1);
+            esi_infoArray[i].position = bim_line.pos;           
             variant_data_ptr += indi_num_fam;
         }
+        
 
 
         for (int k = 0; k < thread_num; k++) {
@@ -568,20 +621,31 @@ Module_vqtl_drm(int argc, char *argv[])
         
         bodfileseek(&bod_data, probe_start_offset);
         printf("progress by probe of this variant slice:\n");
+        char line[1024];
+        rewind(epi);
         for (j = probe_start_offset; j < j_limit; j += thread_num) {
             printf("%10u/%-10u\n", j - probe_start_offset, probe_slice_len);
             fflush(stdout);
-
+        
             for (int n = 0; n < thread_num; n++) {
                 double *readdata;
                 uint32_t readdata_len;
                 readdata = threads_args[n].probe_data;
                 readdata_len = threads_args[n].oii_num;
                 bodreaddata(&bod_data, readdata, readdata_len);
+                fgets(line, sizeof(line), epi);
+                char *chromosome = strtok(line, "\t");
+                strncpy(threads_args[n].epi_value->chromosome, chromosome, sizeof(threads_args[n].epi_value->chromosome) - 1);              
+                strtok(NULL, "\t");
+                strtok(NULL, "\t");
+                // the physical position column is the forth one
+                char *position = strtok(NULL, "\t");
+                threads_args[n].epi_value->position = atol(position);
                 threads_args[n].probe_offset = j + n;
             }
 
             for (int m = 0; m < thread_num; m++) {
+                threads_args[m].esi_infoArray = esi_infoArray;
                 int pthread_status = pthread_create(&(thread_ids[m]), NULL, drm_thread_worker,
                     &(threads_args[m]));
                 if (pthread_status) {
@@ -605,17 +669,24 @@ Module_vqtl_drm(int argc, char *argv[])
         int left_probe_n = 0;
         uint32_t j_keep = j;
         for (; j < probe_end; j++) {
-
-
             double *readdata;
             uint32_t readdata_len;
             readdata = threads_args[left_probe_n].probe_data;
             readdata_len = threads_args[left_probe_n].oii_num;
             bodreaddata(&bod_data, readdata, readdata_len);
+            fgets(line, sizeof(line), epi);
+            char *chromosome = strtok(line, "\t");
+            strncpy(threads_args[left_probe_n].epi_value->chromosome, chromosome, sizeof(threads_args[left_probe_n].epi_value->chromosome) - 1);      
+            strtok(NULL, "\t");
+            strtok(NULL, "\t");
+            // the physical position column is the forth one
+            char *position = strtok(NULL, "\t");
+            threads_args[left_probe_n].epi_value->position = atol(position);
             threads_args[left_probe_n].probe_offset = j;
             left_probe_n++;
         }
         for (int m = 0; m < left_probe_n; m++) {
+            threads_args[m].esi_infoArray = esi_infoArray;
             int pthread_status = pthread_create(&(thread_ids[m]), NULL, drm_thread_worker,
                            &(threads_args[m]));
             if (pthread_status) {
@@ -639,6 +710,7 @@ Module_vqtl_drm(int argc, char *argv[])
                            se_value_pass_thresh);
 
         fclose(fout);
+        free(esi_infoArray);
     }
     fclose(esi_fout);
     printf("\nesi file was writen.\n");
@@ -662,7 +734,6 @@ Module_vqtl_drm(int argc, char *argv[])
         sprintf(tmp_fname_new, "tmp_%u_%u_%u_%u", probe_slice_start,
                 probe_slice_len, variant_slice_start, variant_slice_len);
         strcat(tmp_fname, tmp_fname_new);
-        //printf("tmp file name : %s\n", tmp_fname);
         FILE *fin = fopen(tmp_fname, "r");
         if (!fin) {
             fprintf(stderr, "open OSCA tmp file failed.\n");
@@ -734,7 +805,7 @@ Module_vqtl_drm(int argc, char *argv[])
     fclose(besd_index_fout);
     fclose(besd_beta_se_fout);
     fclose(besd_meta_fout);
-
+    fclose(epi);
     strcpy(tmp_fname, tmp_dir_name);
     strcat(tmp_fname, "/");
     strcat(tmp_fname, "besd_meta");
@@ -892,6 +963,7 @@ Module_vqtl_svlm(int argc, char *argv[])
     int task_num = args->opt_tast_num;
     int task_id = args->opt_tast_id;
     char res_fname[1024];
+    char epi_fname[1024];
     if (args->opt_outname) {
         strcpy(res_fname, args->opt_outname);
     } else {
@@ -934,15 +1006,19 @@ Module_vqtl_svlm(int argc, char *argv[])
     res_fname[res_fname_len] = '\0';
     strcat(res_fname, ".epi");
     FILE *epi_fout = fopen(res_fname, "w");
+    strcpy(epi_fname, res_fname);
     // pass lines
     for (int i = 0; i < probe_start_offset; i++) {
         OPI_LINE opi_line;
         opireadline(&bod_data, &opi_line);
     }
+    //sum epi number of bars
+    uint32_t epi_num_bars = 0;
     for (int i = probe_start_offset; i < probe_end; i++) {
         OPI_LINE opi_line;
         char chrom[4];
         char ori[4];
+        char gd[2] = "0";
         opireadline(&bod_data, &opi_line);
         if (opi_line.chrom == 201) {
             strcpy(chrom, "X");
@@ -960,8 +1036,9 @@ Module_vqtl_svlm(int argc, char *argv[])
         } else {
             strcpy(ori, "-");
         }
-        fprintf(epi_fout, "%s\t%s\t%u\t%s\t%s\n", chrom, opi_line.probe_id,
-                opi_line.position, opi_line.gene_id, ori);
+        fprintf(epi_fout, "%s\t%s\t%s\t%u\t%s\t%s\n", chrom, opi_line.probe_id,
+                gd, opi_line.position, opi_line.gene_id, ori);
+        epi_num_bars++;
     }
     fclose(epi_fout);
     printf("epi file was writen.\n");
@@ -1009,17 +1086,24 @@ Module_vqtl_svlm(int argc, char *argv[])
     make_svlm_threads_args(thread_num, indi_num_fam, indi_num_oii, align_len,
                           not_need_align, fam_index_array, oii_index_array,
                           probe_slice_start, probe_slice_len, variant_data,
-                          variant_data_len, variant_load_len, threads_args);
+                          variant_data_len, variant_load_len, args->flag_trans,
+                          args->opt_trans_distance_bp, args->flag_cis, args->opt_cis_window_bp, threads_args);
 
     // creat tmp directory
     char tmp_dir_name[256];
     time_t sec = time(NULL);
+    uuid_t uuid; // uuid
+	char uuid_str[37];
+	uuid_generate(uuid);
+	uuid_unparse(uuid, uuid_str);
+    char *uuid_str_break;
+	uuid_str_break = strtok(uuid_str, "-");
     if (task_num > 0 && task_id > 0) {
-        sprintf(tmp_dir_name, "oscatmp_%lu_%d_%d", sec, task_num, task_id);
+        sprintf(tmp_dir_name, "oscatmp_%s_%d_%d", uuid_str_break, task_num, task_id);
     } else if (task_num > 0) {
-        sprintf(tmp_dir_name, "oscatmp_%lu_%d_%d", sec, task_num, 1);
+        sprintf(tmp_dir_name, "oscatmp_%s_%d_%d", uuid_str_break, task_num, 1);
     } else {
-        sprintf(tmp_dir_name, "oscatmp_%lu", sec);
+        sprintf(tmp_dir_name, "oscatmp_%s", uuid_str_break);
     }
     char tmp_fname[1024];
     if (access(tmp_dir_name, F_OK)) {
@@ -1065,6 +1149,13 @@ Module_vqtl_svlm(int argc, char *argv[])
         bimreadline(&plink_data, &bim_line);
     }
 
+    //read epi
+    FILE *epi = fopen(epi_fname, "r");
+        if (epi == NULL) {
+            fprintf(stderr, "Failed to open epi_file\n");
+            fprintf(flog, "Failed to open epi_file\n");
+            return 1;
+        }
     for (int i = variant_start_offset; i < variant_end; i += variant_load_len) {
         variant_slice_start = i;
         if (i + variant_load_len > variant_end) {
@@ -1095,7 +1186,10 @@ Module_vqtl_svlm(int argc, char *argv[])
         variant_data_len_real = variant_slice_len * indi_num_fam;
         bedloaddata_n(&plink_data, variant_data, variant_data_len_real,
                       variant_slice_start, variant_slice_len);
+
+        //write esi file              
         char *variant_data_ptr = variant_data;
+        EPI_ESI_COMMENT *esi_infoArray = (EPI_ESI_COMMENT *)malloc(sizeof(EPI_ESI_COMMENT) * variant_slice_len); 
         for (int i = 0; i < variant_slice_len; i++) {
             float first_allel_freq = 0;
             uint32_t value_num = 0;
@@ -1124,6 +1218,8 @@ Module_vqtl_svlm(int argc, char *argv[])
             fprintf(esi_fout, "%s\t%s\t%f\t%u\t%s\t%s\t%f\n", chrom,
                     bim_line.rsid, bim_line.phy_pos, bim_line.pos,
                     bim_line.allel1, bim_line.allel2, first_allel_freq);
+            strncpy(esi_infoArray[i].chromosome, chrom, sizeof(esi_infoArray[i].chromosome) - 1);
+            esi_infoArray[i].position = bim_line.pos;  
             variant_data_ptr += indi_num_fam;
         }
 
@@ -1138,6 +1234,9 @@ Module_vqtl_svlm(int argc, char *argv[])
         
         bodfileseek(&bod_data, probe_start_offset);
         printf("progress by probe of this variant slice:\n");
+
+        char line[1024];
+        rewind(epi);
         for (j = probe_start_offset; j < j_limit; j += thread_num) {
             printf("%10u/%-10u\n", j - probe_start_offset, probe_slice_len);
             fflush(stdout);
@@ -1150,10 +1249,19 @@ Module_vqtl_svlm(int argc, char *argv[])
                 readdata = threads_args[n].probe_data;
                 readdata_len = threads_args[n].oii_num;
                 bodreaddata(&bod_data, readdata, readdata_len);
+                fgets(line, sizeof(line), epi);
+                char *chromosome = strtok(line, "\t");
+                strncpy(threads_args[n].epi_value->chromosome, chromosome, sizeof(threads_args[n].epi_value->chromosome) - 1);              
+                strtok(NULL, "\t");
+                strtok(NULL, "\t");
+                // the physical position column is the forth one
+                char *position = strtok(NULL, "\t");
+                threads_args[n].epi_value->position = atol(position);
                 threads_args[n].probe_offset = j + n;
             }
 
             for (int m = 0; m < thread_num; m++) {
+                threads_args[m].esi_infoArray = esi_infoArray;
                 int pthread_status = pthread_create(&(thread_ids[m]), NULL, svlm_thread_worker,
                                &(threads_args[m]));
                 if (pthread_status) {
@@ -1182,10 +1290,19 @@ Module_vqtl_svlm(int argc, char *argv[])
             readdata = threads_args[left_probe_n].probe_data;
             readdata_len = threads_args[left_probe_n].oii_num;
             bodreaddata(&bod_data, readdata, readdata_len);
+            fgets(line, sizeof(line), epi);
+            char *chromosome = strtok(line, "\t");
+            strncpy(threads_args[left_probe_n].epi_value->chromosome, chromosome, sizeof(threads_args[left_probe_n].epi_value->chromosome) - 1);              
+            strtok(NULL, "\t");
+            strtok(NULL, "\t");
+            // the physical position column is the forth one
+            char *position = strtok(NULL, "\t");
+            threads_args[left_probe_n].epi_value->position = atol(position);
             threads_args[left_probe_n].probe_offset = j;
             left_probe_n++;
         }
         for (int m = 0; m < left_probe_n; m++) {
+            threads_args[m].esi_infoArray = esi_infoArray;
             int pthread_status = pthread_create(&(thread_ids[m]), NULL, svlm_thread_worker,
                            &(threads_args[m]));
             if (pthread_status) {
@@ -1211,6 +1328,7 @@ Module_vqtl_svlm(int argc, char *argv[])
                            se_value_pass_thresh);
 
         fclose(fout);
+        free(esi_infoArray);
     }
     printf("\nesi file was writen.\n");
     fprintf(flog, "\nesi file was writen.\n");
@@ -1311,6 +1429,7 @@ Module_vqtl_svlm(int argc, char *argv[])
     fclose(besd_index_fout);
     fclose(besd_beta_se_fout);
     fclose(besd_meta_fout);
+    fclose(epi);
 
     strcpy(tmp_fname, tmp_dir_name);
     strcat(tmp_fname, "/");
@@ -1398,7 +1517,7 @@ help_legacy(void)
         "\nHelp:\n"
         "--help         flag, print this message and exit.\n"
         "--vqtl         flag, use vqtl module.\n"
-        "--method        STR, vqtl methods. 'drm' for method DRM, 'svlm' for SVLM.\n"
+        "--vqtl-mtd      STR, vqtl methods. 'drm' for method DRM, 'svlm' for SVLM.\n"
         "--geno          STR, plink genotype files.\n"
         "--pheno         STR, phenotype file in plain text.(not supported yet)\n"
         "--pheno-bod     STR, phenotype files in bod file format.\n"
@@ -1410,10 +1529,10 @@ help_legacy(void)
         "--tast-num      INT, task number would like to divide.\n"
         "--tast-id       INT, task id.\n"
         "--trans        flag, only calculate trans region.(not supported yet)\n"
-        "--trans-distance-bp\n"
+        "--trans-wind\n"
         "                INT, distance from probe in basepair to define as trans.(not supported yet)\n"
         "--cis           flag, only calculate cis region.(not supported yet)\n"
-        "--cis-window-bp\n"
+        "--cis-wind\n"
         "                INT, widow width in basepare defined as cis.(not supported yet)\n"
         "--pthresh     FLOAT, p value to filter beta1 t test result.\n"
         "--mem         FLOAT, GB, memoray used by program, default is 3/4 all memoray.\n"
@@ -1445,7 +1564,7 @@ vqtl_parse_args_legacy(int argc, char *argv[], const char *method, VQTL_ARGS_ptr
 
     args->flag_trans = false;
     args->opt_trans_distance_bp = 5000000;
-    args->flag_cis = false;
+    args->flag_cis = true;
     args->opt_cis_window_bp = 2000000;
 
     args->pthresh = 0.5;
@@ -1453,6 +1572,7 @@ vqtl_parse_args_legacy(int argc, char *argv[], const char *method, VQTL_ARGS_ptr
     args->opt_outname = NULL;
     args->opt_outformat = NULL;
     args->opt_mem = 0.0;
+    bool cis_Exists = false;
 
 
     char out_tast_suffix[64];
@@ -1461,7 +1581,7 @@ vqtl_parse_args_legacy(int argc, char *argv[], const char *method, VQTL_ARGS_ptr
         if (strcmp(argv[i], "--vqtl") == 0) {
             run_this_method++;
         }
-        if (strcmp(argv[i], "--method") == 0) {
+        if (strcmp(argv[i], "--vqtl-mtd") == 0) {
             if (i + 1 < argc && strcmp(argv[i + 1], method) == 0) {
                 run_this_method++;
             }
@@ -1484,14 +1604,14 @@ vqtl_parse_args_legacy(int argc, char *argv[], const char *method, VQTL_ARGS_ptr
                 break;
             }
 
-            if (strcmp(argv[i], "--method") == 0) {
+            if (strcmp(argv[i], "--vqtl-mtd") == 0) {
                 if ( i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
                     args->method = argv[++i];
-                    printf("--method %s\n", argv[i]);
-                    fprintf(flog, "--method %s\n", argv[i]);
+                    printf("--vqtl-mtd %s\n", argv[i]);
+                    fprintf(flog, "--vqtl-mtd %s\n", argv[i]);
                     continue;
                 } else {
-                    fprintf(stderr, "--method need a argument.\n");
+                    fprintf(stderr, "--vqtl-mtd need a argument.\n");
                     args->flag_help = true;
                     break;
                 }
@@ -1630,39 +1750,41 @@ vqtl_parse_args_legacy(int argc, char *argv[], const char *method, VQTL_ARGS_ptr
 
             if (strcmp(argv[i], "--trans") == 0) {
                 args->flag_trans = true;
+                args->flag_cis = false;
                 printf("--trans\n");
                 fprintf(flog, "--trans");
                 continue;
             }
 
-            if (strcmp(argv[i], "--trans-distance-bp") == 0) {
+            if (strcmp(argv[i], "--trans-wind") == 0) {
                 if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
                     args->opt_trans_distance_bp = atoi(argv[++i]);
-                    printf("--trans-distance-bp %s\n", argv[i]);
-                    fprintf(flog, "--trans-distance-bp %s\n", argv[i]);
+                    printf("--trans-wind %s\n", argv[i]);
+                    fprintf(flog, "--trans-wind %s\n", argv[i]);
                     continue;
                 } else {
-                    fprintf(stderr, "--trans-distance-bp need a argument.\n");
+                    fprintf(stderr, "--trans-wind need a argument.\n");
                     args->flag_help = true;
                     break;
                 }
             }
-
+            //cis default true
             if (strcmp(argv[i], "--cis") == 0) {
                 args->flag_cis = true;
+                cis_Exists = true;
                 printf("--cis\n");
                 fprintf(flog, "--cis\n");
                 continue;
             }
 
-            if (strcmp(argv[i], "--cis-window-bp") == 0) {
+            if (strcmp(argv[i], "--cis-wind") == 0) {
                 if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
                     args->opt_cis_window_bp = atoi(argv[++i]);
-                    printf("--cis-window-bp %s\n", argv[i]);
-                    fprintf(flog, "--cis-window-bp %s\n", argv[i]);
+                    printf("--cis-wind %s\n", argv[i]);
+                    fprintf(flog, "--cis-wind %s\n", argv[i]);
                     continue;
                 } else {
-                    fprintf(stderr, "--cis-window-bp need a argument.\n");
+                    fprintf(stderr, "--cis-wind need a argument.\n");
                     args->flag_help = true;
                     break;
                 }
@@ -1725,6 +1847,8 @@ vqtl_parse_args_legacy(int argc, char *argv[], const char *method, VQTL_ARGS_ptr
             args->flag_help = true;
             break;
         }
+        if (cis_Exists && args->flag_trans) args->flag_cis = true;
+        if (args->flag_cis && (!args->flag_trans))  args->pthresh = 1.0;
     }
     fclose(flog);
     if (!args->arg_geno_file || (!args->opt_pheno_bod && !args->opt_pheno_txt)) {
@@ -1743,6 +1867,7 @@ compare_uint32(const void *a, const void *b)
 
 /*
      BKDR Hash Function
+     Compute hash value
  */
 static unsigned int
 BKDRHash(char *str)
@@ -1815,6 +1940,7 @@ align_fam_oii_ids(FAM_LINE_ptr fam_lines, uint32_t fam_line_num,
                     strcat(str2, fam_lines[next_ptr->data_index].within_famid);
                     if (strcmp(str1, str2) == 0) {
                         duplicat_num++;
+                        //remove
                         next_ptr->data_index = -1;
                     }
                     next_ptr = next_ptr->next;
@@ -1888,8 +2014,8 @@ make_drm_threads_args(
     uint32_t *oii_index_array,
     uint32_t probe_slice_start, uint32_t probe_slice_len,
     char *variant_data, uint64_t variant_data_len, uint32_t variant_load_len,
-    DRM_THREAD_ARGS_ptr thread_args) {
-        
+    bool flag_trans, int opt_trans_distance_bp, bool flag_cis, int opt_cis_window_bp, DRM_THREAD_ARGS_ptr thread_args) {
+
     for (int i = 0; i < thread_num; i++) {
         thread_args[i].thread_index = i;
         thread_args[i].thread_num = thread_num;
@@ -1907,6 +2033,11 @@ make_drm_threads_args(
         thread_args[i].variant_data = variant_data;
         thread_args[i].variant_data_len_char = variant_data_len;
 
+        thread_args[i].flag_trans = flag_trans;
+        thread_args[i].opt_trans_distance_bp = opt_trans_distance_bp;
+        thread_args[i].flag_cis = flag_cis;
+        thread_args[i].opt_cis_window_bp = opt_cis_window_bp;
+
         //printf("%u %u %u %u\n", indi_num_oii, align_len, vari_num, variant_load_num);
         //all need test malloc exit status.
         thread_args[i].probe_data = (double *)malloc(sizeof(double) * indi_num_oii);
@@ -1916,6 +2047,7 @@ make_drm_threads_args(
         thread_args[i].geno_array = (double *)malloc(sizeof(double) * align_len);
         thread_args[i].pheno_array = (double *)malloc(sizeof(double) * align_len);
         thread_args[i].result = (float *)malloc(sizeof(float) * variant_load_len * 3);
+        thread_args[i].epi_value = (EPI_ESI_COMMENT *)malloc(sizeof(EPI_ESI_COMMENT) * 1); 
 
         if (!thread_args[i].probe_data ||
             !thread_args[i].g0_array || !thread_args[i].g1_array ||
@@ -2014,6 +2146,11 @@ free_drm_threads_args_malloc(DRM_THREAD_ARGS_ptr thread_args, int thread_num)
             thread_args[i].result = NULL;
         }
 
+        if(thread_args[i].epi_value) {
+            free(thread_args[i].epi_value);
+            thread_args[i].epi_value = NULL;
+        }
+
     }
     return;
 }
@@ -2045,7 +2182,6 @@ qmedian(double *array, int p, int r, int pos)
     }
 }
 
-
 static void *
 drm_thread_worker(void *args) {
     DRM_THREAD_ARGS_ptr args_in = (DRM_THREAD_ARGS_ptr)args;
@@ -2075,116 +2211,379 @@ drm_thread_worker(void *args) {
     double *pheno_data_aligned = args_in->pheno_array;
     float *result = args_in->result;
 
-    for (int i = 0; i < variant_slice_len; i++) {
-        uint32_t align_len_rm_missing = 0;
-        char *current_geno_one = variant_data_loaded + i * fam_num;
-        uint32_t g0_num = 0, g1_num = 0, g2_num = 0;
+    //make sure cis & trans
+    uint32_t epi_cis_start = args_in->epi_value->position - args_in->opt_cis_window_bp;
+    uint32_t epi_cis_end = args_in->epi_value->position + args_in->opt_cis_window_bp;
+    uint32_t epi_trans_start = args_in->epi_value->position - args_in->opt_trans_distance_bp;
+    uint32_t epi_trans_end = args_in->epi_value->position + args_in->opt_trans_distance_bp;
+    // count valid number that pass the cis / trans conditions
+    int valid_num = 0;
+    if (args_in->flag_cis && !(args_in->flag_trans)) 
+    {  
+        for (int i = 0; i < variant_slice_len; i++) {
+            if(strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 && 
+                args_in->esi_infoArray[i].position >= epi_cis_start && args_in->esi_infoArray[i].position <= epi_cis_end) {
+                uint32_t align_len_rm_missing = 0;
+                char *current_geno_one = variant_data_loaded + i * fam_num;
+                uint32_t g0_num = 0, g1_num = 0, g2_num = 0;
+                for (uint32_t j = 0; j < align_len; j++) {
+                    uint32_t geno_index = 0;
+                    uint32_t pheno_index = 0;
+                    char geno_value;
+                    double pheno_value;
+                    geno_index = fam_index_array[j];
+                    geno_value = current_geno_one[geno_index];
+                    pheno_index = oii_index_array[j];
+                    pheno_value = pheno_data[pheno_index];
+                
+                    // do I need use other way to compare float number?
+                    if (geno_value != 4 && pheno_value != -9.0) {
+                        if (geno_value == 0) {
+                            g0_array[g0_num] = pheno_value;
+                            g0_num++;
+                        } else if (geno_value == 1) {
+                            g1_array[g1_num] = pheno_value;
+                            g1_num++;
+                        } else if (geno_value == 2) {
+                            g2_array[g2_num] = pheno_value;
+                            g2_num++;
+                        } else {
+                            fprintf(stderr, "geno value can not be others.\n");
+                            return NULL;
+                        }
 
-        for (uint32_t j = 0; j < align_len; j++) {
-            uint32_t geno_index = 0;
-            uint32_t pheno_index = 0;
-            char geno_value;
-            double pheno_value;
-            geno_index = fam_index_array[j];
-            geno_value = current_geno_one[geno_index];
-            pheno_index = oii_index_array[j];
-            pheno_value = pheno_data[pheno_index];
-           
-            // do I need use other way to compare float number?
-            if (geno_value != 4 && pheno_value != -9.0) {
-                if (geno_value == 0) {
-                    g0_array[g0_num] = pheno_value;
-                    g0_num++;
-                } else if (geno_value == 1) {
-                    g1_array[g1_num] = pheno_value;
-                    g1_num++;
-                } else if (geno_value == 2) {
-                    g2_array[g2_num] = pheno_value;
-                    g2_num++;
-                } else {
-                    fprintf(stderr, "geno value can not be others.\n");
-                    return NULL;
+                        align_len_rm_missing++;
+                    }
                 }
 
-                align_len_rm_missing++;
+                /*new method to get median.*/
+                if (g0_num > 0) {
+                    double geno_0_median = 0.0;
+                    if (g0_num % 2) {
+                        geno_0_median = qmedian(g0_array, 0, g0_num - 1, g0_num / 2);
+                    } else {
+                        geno_0_median =
+                            (qmedian(g0_array, 0, g0_num - 1, g0_num / 2 - 1) +
+                            qmedian(g0_array, 0, g0_num - 1, g0_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = 0;
+                    for (uint32_t i = 0; i < g0_num; i++) {
+                        double tmp = 0;
+                        geno_data_aligned[copy_len] = (double)0.0;
+                        tmp = g0_array[i] - geno_0_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+
+                if (g1_num > 0) {
+                    double geno_1_median = 0.0;
+                    if (g1_num % 2) {
+                        geno_1_median = qmedian(g1_array, 0, g1_num - 1, g1_num / 2);
+                    } else {
+                        geno_1_median =
+                            (qmedian(g1_array, 0, g1_num - 1, g1_num / 2 - 1) +
+                            qmedian(g1_array, 0, g1_num - 1, g1_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = g0_num;
+                    for (uint32_t i = 0; i < g1_num; i++) {
+                        double tmp = 0.0;
+                        geno_data_aligned[copy_len] = (double)1.0;
+                        tmp = g1_array[i] - geno_1_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+                if (g2_num > 0) {
+                    double geno_2_median = 0.0;
+                    if (g2_num % 2) {
+                        geno_2_median = qmedian(g2_array, 0, g2_num - 1, g2_num / 2);
+                    } else {
+                        geno_2_median =
+                            (qmedian(g2_array, 0, g2_num - 1, g2_num / 2 - 1) +
+                            qmedian(g2_array, 0, g2_num - 1, g2_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = g0_num + g1_num;
+                    for (uint32_t i = 0; i < g2_num; i++) {
+                        double tmp = 0.0;
+                        geno_data_aligned[copy_len] = (double)2.0;
+                        tmp = g2_array[i] - geno_2_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+
+                double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
+                double beta0 = 0.0, se_beta0 = 0.0;
+                double cov01, sumsq;
+                gsl_fit_linear(geno_data_aligned, 1, pheno_data_aligned, 1,
+                    align_len_rm_missing, &beta0, &beta1, &se_beta0, &cov01, &se_beta1,
+                    &sumsq);
+                se_beta1 = sqrt(se_beta1);
+                double t1 = beta1 / se_beta1;
+                p_beta1 = t1 < 0 ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
+                                : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+                
+                result[i * 3] = (float)beta1;
+                result[i * 3 + 1] = (float)se_beta1;
+                result[i * 3 + 2] = (float)p_beta1;
+                valid_num++;
+            } else {
+                result[i * 3] = 2.0;
+                result[i * 3 + 1] = 2.0;
+                result[i * 3 + 2] = 2.0;
             }
         }
 
-        /*new method to get median.*/
-        if (g0_num > 0) {
-            double geno_0_median = 0.0;
-            if (g0_num % 2) {
-                geno_0_median = qmedian(g0_array, 0, g0_num - 1, g0_num / 2);
+
+    }else if (!(args_in->flag_cis) && args_in->flag_trans)
+    {
+        for (int i = 0; i < variant_slice_len; i++) {
+            uint32_t align_len_rm_missing = 0;
+            if((strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 &&
+             args_in->esi_infoArray[i].position < epi_trans_start && args_in->esi_infoArray[i].position > epi_trans_end) || 
+             strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) != 0) {
+                char *current_geno_one = variant_data_loaded + i * fam_num;
+                uint32_t g0_num = 0, g1_num = 0, g2_num = 0;
+                for (uint32_t j = 0; j < align_len; j++) {
+                    uint32_t geno_index = 0;
+                    uint32_t pheno_index = 0;
+                    char geno_value;
+                    double pheno_value;
+                    geno_index = fam_index_array[j];
+                    geno_value = current_geno_one[geno_index];
+                    pheno_index = oii_index_array[j];
+                    pheno_value = pheno_data[pheno_index];
+                
+                    // do I need use other way to compare float number?
+                    if (geno_value != 4 && pheno_value != -9.0) {
+                        if (geno_value == 0) {
+                            g0_array[g0_num] = pheno_value;
+                            g0_num++;
+                        } else if (geno_value == 1) {
+                            g1_array[g1_num] = pheno_value;
+                            g1_num++;
+                        } else if (geno_value == 2) {
+                            g2_array[g2_num] = pheno_value;
+                            g2_num++;
+                        } else {
+                            fprintf(stderr, "geno value can not be others.\n");
+                            return NULL;
+                        }
+
+                        align_len_rm_missing++;
+                    }
+                }
+
+                /*new method to get median.*/
+                if (g0_num > 0) {
+                    double geno_0_median = 0.0;
+                    if (g0_num % 2) {
+                        geno_0_median = qmedian(g0_array, 0, g0_num - 1, g0_num / 2);
+                    } else {
+                        geno_0_median =
+                            (qmedian(g0_array, 0, g0_num - 1, g0_num / 2 - 1) +
+                            qmedian(g0_array, 0, g0_num - 1, g0_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = 0;
+                    for (uint32_t i = 0; i < g0_num; i++) {
+                        double tmp = 0;
+                        geno_data_aligned[copy_len] = (double)0.0;
+                        tmp = g0_array[i] - geno_0_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+
+                if (g1_num > 0) {
+                    double geno_1_median = 0.0;
+                    if (g1_num % 2) {
+                        geno_1_median = qmedian(g1_array, 0, g1_num - 1, g1_num / 2);
+                    } else {
+                        geno_1_median =
+                            (qmedian(g1_array, 0, g1_num - 1, g1_num / 2 - 1) +
+                            qmedian(g1_array, 0, g1_num - 1, g1_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = g0_num;
+                    for (uint32_t i = 0; i < g1_num; i++) {
+                        double tmp = 0.0;
+                        geno_data_aligned[copy_len] = (double)1.0;
+                        tmp = g1_array[i] - geno_1_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+                if (g2_num > 0) {
+                    double geno_2_median = 0.0;
+                    if (g2_num % 2) {
+                        geno_2_median = qmedian(g2_array, 0, g2_num - 1, g2_num / 2);
+                    } else {
+                        geno_2_median =
+                            (qmedian(g2_array, 0, g2_num - 1, g2_num / 2 - 1) +
+                            qmedian(g2_array, 0, g2_num - 1, g2_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = g0_num + g1_num;
+                    for (uint32_t i = 0; i < g2_num; i++) {
+                        double tmp = 0.0;
+                        geno_data_aligned[copy_len] = (double)2.0;
+                        tmp = g2_array[i] - geno_2_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+
+                double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
+                double beta0 = 0.0, se_beta0 = 0.0;
+                double cov01, sumsq;
+                gsl_fit_linear(geno_data_aligned, 1, pheno_data_aligned, 1,
+                    align_len_rm_missing, &beta0, &beta1, &se_beta0, &cov01, &se_beta1,
+                    &sumsq);
+                se_beta1 = sqrt(se_beta1);
+                double t1 = beta1 / se_beta1;
+                p_beta1 = t1 < 0 ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
+                                : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+                
+                result[i * 3] = (float)beta1;
+                result[i * 3 + 1] = (float)se_beta1;
+                result[i * 3 + 2] = (float)p_beta1;
+                valid_num++;
             } else {
-                geno_0_median =
-                    (qmedian(g0_array, 0, g0_num - 1, g0_num / 2 - 1) +
-                     qmedian(g0_array, 0, g0_num - 1, g0_num / 2)) /
-                    2;
-            }
-            uint32_t copy_len = 0;
-            for (uint32_t i = 0; i < g0_num; i++) {
-                double tmp = 0;
-                geno_data_aligned[copy_len] = (double)0.0;
-                tmp = g0_array[i] - geno_0_median;
-                pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
-                copy_len++;
+                result[i * 3] = 2.0;
+                result[i * 3 + 1] = 2.0;
+                result[i * 3 + 2] = 2.0;
             }
         }
 
-        if (g1_num > 0) {
-            double geno_1_median = 0.0;
-            if (g1_num % 2) {
-                geno_1_median = qmedian(g1_array, 0, g1_num - 1, g1_num / 2);
-            } else {
-                geno_1_median =
-                    (qmedian(g1_array, 0, g1_num - 1, g1_num / 2 - 1) +
-                     qmedian(g1_array, 0, g1_num - 1, g1_num / 2)) /
-                    2;
-            }
-            uint32_t copy_len = g0_num;
-            for (uint32_t i = 0; i < g1_num; i++) {
-                double tmp = 0.0;
-                geno_data_aligned[copy_len] = (double)1.0;
-                tmp = g1_array[i] - geno_1_median;
-                pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
-                copy_len++;
-            }
-        }
-        if (g2_num > 0) {
-            double geno_2_median = 0.0;
-            if (g2_num % 2) {
-                geno_2_median = qmedian(g2_array, 0, g2_num - 1, g2_num / 2);
-            } else {
-                geno_2_median =
-                    (qmedian(g2_array, 0, g2_num - 1, g2_num / 2 - 1) +
-                     qmedian(g2_array, 0, g2_num - 1, g2_num / 2)) /
-                    2;
-            }
-            uint32_t copy_len = g0_num + g1_num;
-            for (uint32_t i = 0; i < g2_num; i++) {
-                double tmp = 0.0;
-                geno_data_aligned[copy_len] = (double)2.0;
-                tmp = g2_array[i] - geno_2_median;
-                pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
-                copy_len++;
-            }
-        }
+    }else if(args_in->flag_cis && args_in->flag_trans)
+    {
+        for (int i = 0; i < variant_slice_len; i++) {
+            uint32_t align_len_rm_missing = 0;
+            if((strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 &&
+             args_in->esi_infoArray[i].position >= epi_cis_start && args_in->esi_infoArray[i].position <= epi_cis_end) || 
+             ((strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 &&
+             args_in->esi_infoArray[i].position < epi_trans_start && args_in->esi_infoArray[i].position > epi_trans_end) ||
+             strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) != 0)) {
+                char *current_geno_one = variant_data_loaded + i * fam_num;
+                uint32_t g0_num = 0, g1_num = 0, g2_num = 0;
+                for (uint32_t j = 0; j < align_len; j++) {
+                    uint32_t geno_index = 0;
+                    uint32_t pheno_index = 0;
+                    char geno_value;
+                    double pheno_value;
+                    geno_index = fam_index_array[j];
+                    geno_value = current_geno_one[geno_index];
+                    pheno_index = oii_index_array[j];
+                    pheno_value = pheno_data[pheno_index];
+                
+                    // do I need use other way to compare float number?
+                    if (geno_value != 4 && pheno_value != -9.0) {
+                        if (geno_value == 0) {
+                            g0_array[g0_num] = pheno_value;
+                            g0_num++;
+                        } else if (geno_value == 1) {
+                            g1_array[g1_num] = pheno_value;
+                            g1_num++;
+                        } else if (geno_value == 2) {
+                            g2_array[g2_num] = pheno_value;
+                            g2_num++;
+                        } else {
+                            fprintf(stderr, "geno value can not be others.\n");
+                            return NULL;
+                        }
 
-        double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
-        double beta0 = 0.0, se_beta0 = 0.0;
-        double cov01, sumsq;
-        gsl_fit_linear(geno_data_aligned, 1, pheno_data_aligned, 1,
-            align_len_rm_missing, &beta0, &beta1, &se_beta0, &cov01, &se_beta1,
-            &sumsq);
-        se_beta1 = sqrt(se_beta1);
-        double t1 = beta1 / se_beta1;
-        p_beta1 = t1 < 0 ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
-                         : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
-        
-        result[i * 3] = (float)beta1;
-        result[i * 3 + 1] = (float)se_beta1;
-        result[i * 3 + 2] = (float)p_beta1;
+                        align_len_rm_missing++;
+                    }
+                }
+
+                /*new method to get median.*/
+                if (g0_num > 0) {
+                    double geno_0_median = 0.0;
+                    if (g0_num % 2) {
+                        geno_0_median = qmedian(g0_array, 0, g0_num - 1, g0_num / 2);
+                    } else {
+                        geno_0_median =
+                            (qmedian(g0_array, 0, g0_num - 1, g0_num / 2 - 1) +
+                            qmedian(g0_array, 0, g0_num - 1, g0_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = 0;
+                    for (uint32_t i = 0; i < g0_num; i++) {
+                        double tmp = 0;
+                        geno_data_aligned[copy_len] = (double)0.0;
+                        tmp = g0_array[i] - geno_0_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+
+                if (g1_num > 0) {
+                    double geno_1_median = 0.0;
+                    if (g1_num % 2) {
+                        geno_1_median = qmedian(g1_array, 0, g1_num - 1, g1_num / 2);
+                    } else {
+                        geno_1_median =
+                            (qmedian(g1_array, 0, g1_num - 1, g1_num / 2 - 1) +
+                            qmedian(g1_array, 0, g1_num - 1, g1_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = g0_num;
+                    for (uint32_t i = 0; i < g1_num; i++) {
+                        double tmp = 0.0;
+                        geno_data_aligned[copy_len] = (double)1.0;
+                        tmp = g1_array[i] - geno_1_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+                if (g2_num > 0) {
+                    double geno_2_median = 0.0;
+                    if (g2_num % 2) {
+                        geno_2_median = qmedian(g2_array, 0, g2_num - 1, g2_num / 2);
+                    } else {
+                        geno_2_median =
+                            (qmedian(g2_array, 0, g2_num - 1, g2_num / 2 - 1) +
+                            qmedian(g2_array, 0, g2_num - 1, g2_num / 2)) /
+                            2;
+                    }
+                    uint32_t copy_len = g0_num + g1_num;
+                    for (uint32_t i = 0; i < g2_num; i++) {
+                        double tmp = 0.0;
+                        geno_data_aligned[copy_len] = (double)2.0;
+                        tmp = g2_array[i] - geno_2_median;
+                        pheno_data_aligned[copy_len] = (tmp < 0)? -tmp: tmp;
+                        copy_len++;
+                    }
+                }
+
+                double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
+                double beta0 = 0.0, se_beta0 = 0.0;
+                double cov01, sumsq;
+                gsl_fit_linear(geno_data_aligned, 1, pheno_data_aligned, 1,
+                    align_len_rm_missing, &beta0, &beta1, &se_beta0, &cov01, &se_beta1,
+                    &sumsq);
+                se_beta1 = sqrt(se_beta1);
+                double t1 = beta1 / se_beta1;
+                p_beta1 = t1 < 0 ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
+                                : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+                
+                result[i * 3] = (float)beta1;
+                result[i * 3 + 1] = (float)se_beta1;
+                result[i * 3 + 2] = (float)p_beta1;
+                valid_num++;
+            }  else {
+                result[i * 3] = 2.0;
+                result[i * 3 + 1] = 2.0;
+                result[i * 3 + 2] = 2.0;
+            }
+        }
     }
+    args_in->valid_num = valid_num;
 
 #if defined VQTL_DEBUG_INFO || DEBUG_INFO
     clock_t t2 = clock();
@@ -2201,7 +2600,8 @@ make_svlm_threads_args(
     uint32_t align_len, char not_need_align, uint32_t *fam_index_array,
     uint32_t *oii_index_arrary, uint32_t probe_slice_start,
     uint32_t probe_slice_len, char *variant_data, uint64_t variant_data_len,
-    uint32_t variant_load_len, SVLM_THREAD_ARGS_ptr thread_args) {
+    uint32_t variant_load_len, bool flag_trans, int opt_trans_distance_bp, bool flag_cis, 
+    int opt_cis_window_bp, SVLM_THREAD_ARGS_ptr thread_args) {
 
     for (int i = 0; i < thread_num; i++) {
         thread_args[i].thread_index = i;
@@ -2226,10 +2626,16 @@ make_svlm_threads_args(
         thread_args[i].variant_data = variant_data;
         thread_args[i].variant_data_len_char = variant_data_len;
 
+        thread_args[i].flag_trans = flag_trans;
+        thread_args[i].opt_trans_distance_bp = opt_trans_distance_bp;
+        thread_args[i].flag_cis = flag_cis;
+        thread_args[i].opt_cis_window_bp = opt_cis_window_bp;
+
         thread_args[i].probe_data = (double *)malloc(sizeof(double) * indi_num_oii);
         thread_args[i].geno_array = (double *)malloc(sizeof(double) * align_len);
         thread_args[i].pheno_array = (double *)malloc(sizeof(double) * align_len);
         thread_args[i].result = (float *)malloc(sizeof(float) * variant_load_len * 3);
+        thread_args[i].epi_value = (EPI_ESI_COMMENT *)malloc(sizeof(EPI_ESI_COMMENT) * 1);
     }
     return thread_args;
 }
@@ -2270,6 +2676,11 @@ free_svlm_threads_args_malloc(SVLM_THREAD_ARGS_ptr thread_args, int thread_num)
             free(thread_args[i].result);
             thread_args[i].result = NULL;
         }
+
+        if(thread_args[i].epi_value) {
+            free(thread_args[i].epi_value);
+            thread_args[i].epi_value = NULL;
+        }
     }
 
     return;
@@ -2300,54 +2711,187 @@ svlm_thread_worker(void *args)
     double *pheno_array = args_in->pheno_array;
     float *result = args_in->result;
 
-    for (int i = 0; i < variant_slice_len; i++) {
-        char *varinat_data_one = variant_data + (i * fam_num);
-        uint32_t align_len_rm_missing = 0;
-        uint32_t geno_index = 0, pheno_index = 0;
-        char geno_value = 0;
-        double pheno_value = 0.0;
+    //make sure cis & trans
+    uint32_t epi_cis_start = args_in->epi_value->position - args_in->opt_cis_window_bp;
+    uint32_t epi_cis_end = args_in->epi_value->position + args_in->opt_cis_window_bp;
+    uint32_t epi_trans_start = args_in->epi_value->position - args_in->opt_trans_distance_bp;
+    uint32_t epi_trans_end = args_in->epi_value->position + args_in->opt_trans_distance_bp;
+    int valid_num = 0;
+    if (args_in->flag_cis && !(args_in->flag_trans)){
+        for (int i = 0; i < variant_slice_len; i++) {
+            if(strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 && 
+            args_in->esi_infoArray[i].position >= epi_cis_start && args_in->esi_infoArray[i].position <= epi_cis_end) {
+                char *varinat_data_one = variant_data + (i * fam_num);
+                uint32_t align_len_rm_missing = 0;
+                uint32_t geno_index = 0, pheno_index = 0;
+                char geno_value = 0;
+                double pheno_value = 0.0;
 
-        for (int j = 0; j < align_len; j++) {
+                for (int j = 0; j < align_len; j++) {
 
-            geno_index = fam_index_array[j];
-            pheno_index = oii_index_array[j];
-            geno_value = varinat_data_one[geno_index];
-            pheno_value = probe_data[pheno_index];
-            
-            if (geno_value != 4 && pheno_value != -9.0) {
-                geno_array[align_len_rm_missing] = (double)geno_value;
-                pheno_array[align_len_rm_missing] = pheno_value;
-                align_len_rm_missing++;
-            }            
+                    geno_index = fam_index_array[j];
+                    pheno_index = oii_index_array[j];
+                    geno_value = varinat_data_one[geno_index];
+                    pheno_value = probe_data[pheno_index];
+                    
+                    if (geno_value != 4 && pheno_value != -9.0) {
+                        geno_array[align_len_rm_missing] = (double)geno_value;
+                        pheno_array[align_len_rm_missing] = pheno_value;
+                        align_len_rm_missing++;
+                    }            
+                }
+
+                double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
+                double beta0 = 0.0, se_beta0 = 0.0;
+                double cov01, sumsq;
+
+                gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
+                    &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+
+                // pheno_array turn into array of residual square.
+                for (int k = 0; k < align_len_rm_missing; k++) {
+                    double residule;
+                    residule = pheno_array[k] - (beta0 + beta1 * geno_array[k]);
+                    pheno_array[k] = residule * residule;
+                }
+                gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
+                            &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+
+                se_beta1 = sqrt(se_beta1);
+                double t1 = beta1 / se_beta1;
+                p_beta1 = t1 < 0
+                            ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
+                            : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+
+                result[i * 3] = (float)beta1;
+                result[i * 3 + 1] = (float)se_beta1;
+                result[i * 3 + 2] = (float)p_beta1;
+                valid_num++;
+            } else {
+                result[i * 3] = 2.0;
+                result[i * 3 + 1] = 2.0;
+                result[i * 3 + 2] = 2.0;
+            }
         }
+    }else if (!(args_in->flag_cis) && args_in->flag_trans)
+    {
+        for (int i = 0; i < variant_slice_len; i++) {
+            if((strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 &&
+             args_in->esi_infoArray[i].position < epi_trans_start && args_in->esi_infoArray[i].position > epi_trans_end) || 
+             strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) != 0) {
+                char *varinat_data_one = variant_data + (i * fam_num);
+                uint32_t align_len_rm_missing = 0;
+                uint32_t geno_index = 0, pheno_index = 0;
+                char geno_value = 0;
+                double pheno_value = 0.0;
 
-        double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
-        double beta0 = 0.0, se_beta0 = 0.0;
-        double cov01, sumsq;
+                for (int j = 0; j < align_len; j++) {
 
-        gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
-            &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+                    geno_index = fam_index_array[j];
+                    pheno_index = oii_index_array[j];
+                    geno_value = varinat_data_one[geno_index];
+                    pheno_value = probe_data[pheno_index];
+                    
+                    if (geno_value != 4 && pheno_value != -9.0) {
+                        geno_array[align_len_rm_missing] = (double)geno_value;
+                        pheno_array[align_len_rm_missing] = pheno_value;
+                        align_len_rm_missing++;
+                    }            
+                }
 
-        // pheno_array turn into array of residual square.
-        for (int k = 0; k < align_len_rm_missing; k++) {
-            double residule;
-            residule = pheno_array[k] - (beta0 + beta1 * geno_array[k]);
-            pheno_array[k] = residule * residule;
+                double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
+                double beta0 = 0.0, se_beta0 = 0.0;
+                double cov01, sumsq;
+
+                gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
+                    &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+
+                // pheno_array turn into array of residual square.
+                for (int k = 0; k < align_len_rm_missing; k++) {
+                    double residule;
+                    residule = pheno_array[k] - (beta0 + beta1 * geno_array[k]);
+                    pheno_array[k] = residule * residule;
+                }
+                gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
+                            &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+
+                se_beta1 = sqrt(se_beta1);
+                double t1 = beta1 / se_beta1;
+                p_beta1 = t1 < 0
+                            ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
+                            : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+
+                result[i * 3] = (float)beta1;
+                result[i * 3 + 1] = (float)se_beta1;
+                result[i * 3 + 2] = (float)p_beta1;
+                valid_num++;
+            } else {
+                result[i * 3] = 2.0;
+                result[i * 3 + 1] = 2.0;
+                result[i * 3 + 2] = 2.0;
+            }
         }
-        gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
-                       &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+    }else if(args_in->flag_cis && args_in->flag_trans){
+        for (int i = 0; i < variant_slice_len; i++) {
+            if((strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 &&
+             args_in->esi_infoArray[i].position >= epi_cis_start && args_in->esi_infoArray[i].position <= epi_cis_end) || 
+             ((strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) == 0 &&
+             args_in->esi_infoArray[i].position < epi_trans_start && args_in->esi_infoArray[i].position > epi_trans_end) ||
+             strcmp(args_in->esi_infoArray[i].chromosome, args_in->epi_value->chromosome) != 0)) {
+                char *varinat_data_one = variant_data + (i * fam_num);
+                uint32_t align_len_rm_missing = 0;
+                uint32_t geno_index = 0, pheno_index = 0;
+                char geno_value = 0;
+                double pheno_value = 0.0;
 
-        se_beta1 = sqrt(se_beta1);
-        double t1 = beta1 / se_beta1;
-        p_beta1 = t1 < 0
-                      ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
-                      : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+                for (int j = 0; j < align_len; j++) {
 
-        result[i * 3] = (float)beta1;
-        result[i * 3 + 1] = (float)se_beta1;
-        result[i * 3 + 2] = (float)p_beta1;
-        
+                    geno_index = fam_index_array[j];
+                    pheno_index = oii_index_array[j];
+                    geno_value = varinat_data_one[geno_index];
+                    pheno_value = probe_data[pheno_index];
+                    
+                    if (geno_value != 4 && pheno_value != -9.0) {
+                        geno_array[align_len_rm_missing] = (double)geno_value;
+                        pheno_array[align_len_rm_missing] = pheno_value;
+                        align_len_rm_missing++;
+                    }            
+                }
+
+                double beta1 = 0.0, se_beta1 = 0.0, p_beta1 = 0.0;
+                double beta0 = 0.0, se_beta0 = 0.0;
+                double cov01, sumsq;
+
+                gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
+                    &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+
+                // pheno_array turn into array of residual square.
+                for (int k = 0; k < align_len_rm_missing; k++) {
+                    double residule;
+                    residule = pheno_array[k] - (beta0 + beta1 * geno_array[k]);
+                    pheno_array[k] = residule * residule;
+                }
+                gsl_fit_linear(geno_array, 1, pheno_array, 1, align_len_rm_missing,
+                            &beta0, &beta1, &se_beta0, &cov01, &se_beta1, &sumsq);
+
+                se_beta1 = sqrt(se_beta1);
+                double t1 = beta1 / se_beta1;
+                p_beta1 = t1 < 0
+                            ? 2 * (1 - gsl_cdf_tdist_P(-t1, align_len_rm_missing - 2))
+                            : 2 * (1 - gsl_cdf_tdist_P(t1, align_len_rm_missing - 2));
+
+                result[i * 3] = (float)beta1;
+                result[i * 3 + 1] = (float)se_beta1;
+                result[i * 3 + 2] = (float)p_beta1;
+                valid_num++;
+            } else {
+                result[i * 3] = 2.0;
+                result[i * 3 + 1] = 2.0;
+                result[i * 3 + 2] = 2.0;
+            }
+        }
     }
+    args_in->valid_num = valid_num;
 
 #if defined VQTL_DEBUG_INFO || DEBUG_INFO
     clock_t t2 = clock();
@@ -2370,10 +2914,11 @@ write_tmp_data(void *thread_args_ori, char *args_type,
         for (int i = 0; i < thread_num; i++) {
             uint32_t variant_num_pass_thresh = 0;
             float *result = thread_args[i].result;
+            int valid_num = thread_args[i].valid_num;
             uint32_t variant_slice_len = thread_args[i].variant_slice_len;
             uint32_t variant_slice_start =
                 thread_args[i].variant_slice_start_index;
-            for (int j = 0; j < variant_slice_len; j++) {
+            for (int j = 0; j < variant_slice_len; j++) { // filter p value make it less than 0.5 (for trans / all)
                 uint32_t offset = j * 3;
                 if (result[offset + 2] <= pthresh) {
                     varint_index_pass_thresh[variant_num_pass_thresh] =
@@ -2398,6 +2943,7 @@ write_tmp_data(void *thread_args_ori, char *args_type,
         for (int i = 0; i < thread_num; i++) {
             uint32_t variant_num_pass_thresh = 0;
             float *result = thread_args[i].result;
+            int valid_num = thread_args[i].valid_num;
             uint32_t variant_slice_len = thread_args[i].variant_slice_len;
             uint32_t variant_slice_start =
                 thread_args[i].variant_slice_start_index;

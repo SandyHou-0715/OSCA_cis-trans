@@ -36,7 +36,7 @@
 #define PLINK_MALLOC_BUF_FAIL 5
 #define PLINK_BUFFER_OVERFLOW 6
 #define PLINK_MEGIC_NUM_LEN 3
-#define PLINK_LINE_BUF_LEN 4096
+#define PLINK_LINE_BUF_LEN 16384
 
 
 struct Allel_trimed_stu {
